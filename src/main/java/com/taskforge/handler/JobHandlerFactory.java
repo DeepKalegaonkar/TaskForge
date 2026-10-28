@@ -1,7 +1,6 @@
 package com.taskforge.handler;
 
 import com.taskforge.dto.SubmitJobRequest.JobType;
-import com.taskforge.handler.JobHandler;
 import org.springframework.stereotype.Component;
 
 @Component
@@ -18,6 +17,17 @@ public class JobHandlerFactory {
                 System.out.println("Sending email...");
                 System.out.println("Email sending finished.");
             };
+
+            case FAIL_FOR_TESTING -> () -> {
+                System.out.println("Running deliberate failure test...");
+                throw new RuntimeException(
+                        "Deliberate failure for retry testing"
+                );
+            };
         };
+    }
+
+    public JobHandler createHandler(String type) {
+        return createHandler(JobType.valueOf(type));
     }
 }

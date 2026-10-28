@@ -1,0 +1,2 @@
+ALTER TABLE jobs
+    ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;

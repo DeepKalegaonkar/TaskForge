@@ -1,6 +1,8 @@
 package com.taskforge.service;
 
 import com.taskforge.model.Job;
+import com.taskforge.model.JobAttempt;
+import com.taskforge.repository.JobAttemptRepository;
 import com.taskforge.repository.JobRepository;
 import com.taskforge.scheduler.JobScheduler;
 import org.springframework.stereotype.Service;
@@ -13,10 +15,15 @@ import java.util.concurrent.RejectedExecutionException;
 public class JobService {
 
     private final JobRepository jobRepository;
+    private final JobAttemptRepository jobAttemptRepository;
     private final JobScheduler jobScheduler;
 
-    public JobService(JobRepository jobRepository, JobScheduler jobScheduler){
+    public JobService(
+            JobRepository jobRepository,
+            JobAttemptRepository jobAttemptRepository,
+            JobScheduler jobScheduler){
         this.jobRepository = jobRepository;
+        this.jobAttemptRepository = jobAttemptRepository;
         this.jobScheduler = jobScheduler;
     }
 
@@ -44,13 +51,19 @@ public class JobService {
         return jobRepository.findAll();
     }
 
-    public boolean cancelJob(String id){
-        Optional<Job> job = jobRepository.findById(id);
+    public Optional<List<JobAttempt>> getAttempts(String id){
+        if (!jobRepository.existsById(id)) {
+            return Optional.empty();
+        }
 
-        if(job.isEmpty()){
+        return Optional.of(jobAttemptRepository.findByJobId(id));
+    }
+
+    public boolean cancelJob(String id) {
+        if (jobRepository.findById(id).isEmpty()) {
             return false;
         }
 
-        return jobScheduler.cancel(job.get());
+        return jobScheduler.cancel(id);
     }
 }
