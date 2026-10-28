@@ -24,4 +24,5 @@ public class TaskForgeApplication {
     public static void main(String[] args){
         SpringApplication.run(TaskForgeApplication.class, args);
     }
+
 }

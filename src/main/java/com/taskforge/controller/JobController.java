@@ -1,4 +1,3 @@
-
 package com.taskforge.controller;
 
 import io.swagger.v3.oas.annotations.Operation;
@@ -10,6 +9,7 @@ import com.taskforge.dto.JobResponse;
 import com.taskforge.dto.SubmitJobRequest;
 import com.taskforge.handler.JobHandlerFactory;
 import com.taskforge.model.Job;
+import com.taskforge.model.JobAttempt;
 import com.taskforge.service.JobService;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
@@ -63,6 +63,7 @@ public class JobController {
 
         Job job = new Job(
                 request.name(),
+                request.type(),
                 handlerFactory.createHandler(request.type())
         );
 
@@ -89,8 +90,26 @@ public class JobController {
     }
 
     @Operation(
+            summary = "Get job execution history",
+            description = "Returns every execution attempt of a job, oldest first."
+    )
+    @ApiResponses({
+            @ApiResponse(responseCode = "200", description = "Attempts found"),
+            @ApiResponse(responseCode = "404", description = "Job not found")
+    })
+
+    @GetMapping("/{id}/attempts")
+    public List<JobAttempt> getJobAttempts(@PathVariable String id) {
+        return jobService.getAttempts(id)
+                .orElseThrow(() -> new ResponseStatusException(
+                        HttpStatus.NOT_FOUND,
+                        "Job not found: " + id
+                ));
+    }
+
+    @Operation(
             summary = "List all jobs",
-            description = "Returns all jobs currently stored in memory."
+            description = "Returns all jobs stored in the database, newest first."
     )
     @ApiResponse(
             responseCode = "200",

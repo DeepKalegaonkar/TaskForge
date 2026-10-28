@@ -1,13 +1,18 @@
-
 package com.taskforge.scheduler;
 
 import com.taskforge.model.Job;
 import com.taskforge.model.JobStatus;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
+import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -19,10 +24,7 @@ class JobSchedulerTest {
         AtomicInteger executions = new AtomicInteger(0);
 
         try {
-            Job job = new Job(
-                    "Test Job",
-                    executions::incrementAndGet
-            );
+            Job job = new Job("Test Job", executions::incrementAndGet);
 
             scheduler.submit(job);
             scheduler.shutdown();
@@ -56,10 +58,7 @@ class JobSchedulerTest {
                 releaseJob.await();
             });
 
-            Job queuedJob = new Job(
-                    "Queued Job",
-                    executions::incrementAndGet
-            );
+            Job queuedJob = new Job("Queued Job", executions::incrementAndGet);
 
             scheduler.submit(blockingJob);
 
@@ -74,13 +73,9 @@ class JobSchedulerTest {
             assertEquals(JobStatus.CANCELLED, queuedJob.getStatus());
 
             releaseJob.countDown();
-
             scheduler.shutdown();
 
-            assertTrue(
-                    scheduler.awaitTermination(5, TimeUnit.SECONDS)
-            );
-
+            assertTrue(scheduler.awaitTermination(5, TimeUnit.SECONDS));
             assertEquals(0, executions.get());
             assertEquals(JobStatus.COMPLETED, blockingJob.getStatus());
 
@@ -117,37 +112,40 @@ class JobSchedulerTest {
             throws InterruptedException {
 
         JobScheduler scheduler = new JobScheduler(1, 10);
+        AtomicInteger executions = new AtomicInteger(0);
 
         try {
             Job job = new Job("Failing Job", () -> {
+                executions.incrementAndGet();
                 throw new RuntimeException("Simulated failure");
             });
 
             scheduler.submit(job);
             scheduler.shutdown();
 
+            // First attempt fails, followed by 2s and 4s retry delays.
             assertTrue(
-                    scheduler.awaitTermination(5, TimeUnit.SECONDS)
+                    scheduler.awaitTermination(12, TimeUnit.SECONDS),
+                    "Scheduler should finish all retry attempts within 12 seconds"
             );
 
+            assertEquals(3, executions.get(),
+                    "The handler should run exactly three times");
             assertEquals(JobStatus.FAILED, job.getStatus());
             assertEquals("Simulated failure", job.getFailureReason());
+            assertEquals(3, job.getAttemptCount());
 
         } finally {
             scheduler.shutdown();
         }
     }
 
-
     @Test
     void fullQueueShouldRejectNewJobs() throws InterruptedException {
         JobScheduler scheduler = new JobScheduler(1, 1);
 
-        java.util.concurrent.CountDownLatch jobStarted =
-                new java.util.concurrent.CountDownLatch(1);
-
-        java.util.concurrent.CountDownLatch releaseJob =
-                new java.util.concurrent.CountDownLatch(1);
+        CountDownLatch jobStarted = new CountDownLatch(1);
+        CountDownLatch releaseJob = new CountDownLatch(1);
 
         try {
             Job runningJob = new Job("Running Job", () -> {
@@ -156,19 +154,15 @@ class JobSchedulerTest {
             });
 
             Job queuedJob = new Job("Queued Job", () -> {});
-
             Job rejectedJob = new Job("Rejected Job", () -> {});
 
             scheduler.submit(runningJob);
 
             assertTrue(jobStarted.await(2, TimeUnit.SECONDS));
 
-            // The worker is busy, so this job occupies the one queue slot.
             scheduler.submit(queuedJob);
-
             assertEquals(1, scheduler.getQueueSize());
 
-            // The queue is full, so this submission must fail.
             assertThrows(
                     java.util.concurrent.RejectedExecutionException.class,
                     () -> scheduler.submit(rejectedJob)
@@ -177,11 +171,9 @@ class JobSchedulerTest {
         } finally {
             releaseJob.countDown();
             scheduler.shutdown();
-
             assertTrue(scheduler.awaitTermination(5, TimeUnit.SECONDS));
         }
     }
-
 
     @Test
     void shutdownShouldFinishQueuedJobsAndRejectNewJobs()
@@ -208,9 +200,6 @@ class JobSchedulerTest {
             );
 
             scheduler.submit(secondJob);
-
-            // Initiate shutdown while the first job is running
-            // and the second job is waiting in the queue.
             scheduler.shutdown();
 
             Job lateJob = new Job("Late Job", () -> {});
@@ -252,6 +241,7 @@ class JobSchedulerTest {
 
         Thread starter = new Thread(() -> {
             ready.countDown();
+
             try {
                 start.await();
 
@@ -265,6 +255,7 @@ class JobSchedulerTest {
 
         Thread canceller = new Thread(() -> {
             ready.countDown();
+
             try {
                 start.await();
 
@@ -280,16 +271,15 @@ class JobSchedulerTest {
         canceller.start();
 
         assertTrue(ready.await(2, TimeUnit.SECONDS));
-
         start.countDown();
 
         starter.join();
         canceller.join();
 
-        // Exactly one operation must win.
         assertEquals(
                 1,
-                successfulStarts.get() + successfulCancellations.get()
+                successfulStarts.get() + successfulCancellations.get(),
+                "Exactly one operation must win"
         );
 
         if (successfulStarts.get() == 1) {
@@ -301,5 +291,137 @@ class JobSchedulerTest {
         }
     }
 
+    @Test
+    void claimedJobShouldKeepTheDatabaseAttemptNumber()
+            throws InterruptedException {
 
+        // PostgreSQL increments attempt_count while claiming,
+        // so the scheduler must not increment it a second time.
+        Job claimed = claimedJob(1, () -> {});
+        List<Integer> startedAttempts = new CopyOnWriteArrayList<>();
+        List<Integer> finishedAttempts = new CopyOnWriteArrayList<>();
+        CountDownLatch finished = new CountDownLatch(1);
+
+        JobScheduler scheduler = new JobScheduler(
+                1,
+                10,
+                job -> {},
+                job -> startedAttempts.add(job.getAttemptCount()),
+                job -> {
+                    finishedAttempts.add(job.getAttemptCount());
+                    finished.countDown();
+                },
+                claimOnce(claimed),
+                id -> false
+        );
+
+        try {
+            assertTrue(finished.await(5, TimeUnit.SECONDS));
+
+            assertEquals(JobStatus.COMPLETED, claimed.getStatus());
+            assertEquals(1, claimed.getAttemptCount());
+            assertEquals(List.of(1), startedAttempts);
+            assertEquals(List.of(1), finishedAttempts);
+        } finally {
+            scheduler.shutdown();
+            assertTrue(scheduler.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void failedClaimedJobShouldBeRequeuedThroughTheDatabase()
+            throws InterruptedException {
+
+        Job claimed = claimedJob(1, () -> {
+            throw new RuntimeException("Simulated failure");
+        });
+        AtomicReference<JobStatus> statusAtRetry = new AtomicReference<>();
+        AtomicInteger attemptAtRetry = new AtomicInteger();
+        CountDownLatch retried = new CountDownLatch(1);
+
+        JobScheduler scheduler = new JobScheduler(
+                1,
+                10,
+                job -> {},
+                job -> {},
+                job -> {},
+                claimOnce(claimed),
+                id -> false,
+                job -> {
+                    statusAtRetry.set(job.getStatus());
+                    attemptAtRetry.set(job.getAttemptCount());
+                    retried.countDown();
+                    return true;
+                }
+        );
+
+        try {
+            // First retry waits 2 seconds.
+            assertTrue(retried.await(5, TimeUnit.SECONDS));
+
+            assertEquals(JobStatus.QUEUED, statusAtRetry.get());
+            assertEquals(1, attemptAtRetry.get());
+        } finally {
+            scheduler.shutdown();
+            assertTrue(scheduler.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void claimedJobOnFinalAttemptShouldNotBeRetried()
+            throws InterruptedException {
+
+        Job claimed = claimedJob(3, () -> {
+            throw new RuntimeException("Simulated failure");
+        });
+        AtomicInteger retries = new AtomicInteger();
+        CountDownLatch finished = new CountDownLatch(1);
+
+        JobScheduler scheduler = new JobScheduler(
+                1,
+                10,
+                job -> {},
+                job -> {},
+                job -> finished.countDown(),
+                claimOnce(claimed),
+                id -> false,
+                job -> {
+                    retries.incrementAndGet();
+                    return true;
+                }
+        );
+
+        try {
+            assertTrue(finished.await(5, TimeUnit.SECONDS));
+        } finally {
+            scheduler.shutdown();
+            assertTrue(scheduler.awaitTermination(5, TimeUnit.SECONDS));
+        }
+
+        assertEquals(JobStatus.FAILED, claimed.getStatus());
+        assertEquals(3, claimed.getAttemptCount());
+        assertEquals(0, retries.get());
+    }
+
+    private static Job claimedJob(int attemptCount, com.taskforge.handler.JobHandler handler) {
+        return new Job(
+                java.util.UUID.randomUUID().toString(),
+                "Claimed Job",
+                null,
+                handler,
+                Instant.now(),
+                JobStatus.RUNNING,
+                Instant.now(),
+                null,
+                null,
+                attemptCount
+        );
+    }
+
+    private static java.util.function.Supplier<Optional<Job>> claimOnce(Job job) {
+        AtomicBoolean handedOut = new AtomicBoolean(false);
+        return () -> handedOut.compareAndSet(false, true)
+                ? Optional.of(job)
+                : Optional.empty();
+    }
 }
