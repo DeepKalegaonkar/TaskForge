@@ -10,6 +10,7 @@ import org.springframework.stereotype.Repository;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.sql.Timestamp;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
@@ -29,77 +30,71 @@ public class JobRepository {
         this.handlerFactory = handlerFactory;
 
         this.jobRowMapper = (rs, rowNum) -> {
-            String id = rs.getString("id");
-            String name = rs.getString("name");
             JobType type = JobType.valueOf(rs.getString("job_type"));
             JobStatus status = JobStatus.valueOf(rs.getString("status"));
-
-            Timestamp createdTimestamp = rs.getTimestamp("created_at");
-            Timestamp startedTimestamp = rs.getTimestamp("started_at");
-            Timestamp completedTimestamp = rs.getTimestamp("completed_at");
-
-            Instant createdAt = createdTimestamp.toInstant();
-            Instant startedAt = startedTimestamp != null
-                    ? startedTimestamp.toInstant()
-                    : null;
-            Instant completedAt = completedTimestamp != null
-                    ? completedTimestamp.toInstant()
-                    : null;
-
-            String failureReason = rs.getString("failure_reason");
             int attemptCount = rs.getInt("attempt_count");
 
-            return new Job(
-                    id,
-                    name,
-                    type,
-                    handlerFactory.createHandler(type),
-                    createdAt,
-                    status,
-                    startedAt,
-                    completedAt,
-                    failureReason,
-                    attemptCount
-            );
+            // available_at only matters while a failed job waits to retry.
+            Instant nextAttemptAt =
+                    status == JobStatus.QUEUED && attemptCount > 0
+                            ? toInstant(rs.getTimestamp("available_at"))
+                            : null;
+
+            return Job.builder(
+                            rs.getString("name"),
+                            handlerFactory.createHandler(type)
+                    )
+                    .id(rs.getString("id"))
+                    .type(type)
+                    .status(status)
+                    .createdAt(toInstant(rs.getTimestamp("created_at")))
+                    .startedAt(toInstant(rs.getTimestamp("started_at")))
+                    .completedAt(toInstant(rs.getTimestamp("completed_at")))
+                    .nextAttemptAt(nextAttemptAt)
+                    .failureReason(rs.getString("failure_reason"))
+                    .attemptCount(attemptCount)
+                    .maxAttempts(rs.getInt("max_attempts"))
+                    .timeout(Duration.ofSeconds(rs.getInt("timeout_seconds")))
+                    .idempotencyKey(rs.getString("idempotency_key"))
+                    .cancelRequested(rs.getBoolean("cancel_requested"))
+                    .build();
         };
     }
 
-    public Job save(Job job) {
+    /*
+     * Inserts a new job. Returns false, without inserting, when another
+     * job already uses the same idempotency key.
+     */
+    public boolean insert(Job job) {
         if (job.getType() == null) {
             throw new IllegalArgumentException(
                     "Job type is required for database persistence"
             );
         }
 
-        jdbcTemplate.update(
+        int inserted = jdbcTemplate.update(
                 """
                 INSERT INTO jobs (
                     id, name, job_type, status, created_at,
-                    started_at, completed_at, failure_reason,
-                    attempt_count
+                    available_at, attempt_count, max_attempts,
+                    timeout_seconds, idempotency_key
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (id) DO UPDATE SET
-                    name = EXCLUDED.name,
-                    job_type = EXCLUDED.job_type,
-                    status = EXCLUDED.status,
-                    started_at = EXCLUDED.started_at,
-                    completed_at = EXCLUDED.completed_at,
-                    failure_reason = EXCLUDED.failure_reason,
-                    attempt_count = EXCLUDED.attempt_count
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (idempotency_key) DO NOTHING
                 """,
                 job.getId(),
                 job.getName(),
                 job.getType().name(),
                 job.getStatus().name(),
                 Timestamp.from(job.getCreatedAt()),
-                toTimestamp(job.getStartedAt()),
-                toTimestamp(job.getCompletedAt()),
-                job.getFailureReason(),
-                job.getAttemptCount()
+                Timestamp.from(job.getCreatedAt()),
+                job.getAttemptCount(),
+                job.getMaxAttempts(),
+                Math.toIntExact(job.getTimeout().toSeconds()),
+                job.getIdempotencyKey()
         );
 
-        return job;
+        return inserted == 1;
     }
 
     public Optional<Job> findById(String id) {
@@ -110,10 +105,26 @@ public class JobRepository {
         ).stream().findFirst();
     }
 
+    public Optional<Job> findByIdempotencyKey(String idempotencyKey) {
+        return jdbcTemplate.query(
+                "SELECT * FROM jobs WHERE idempotency_key = ?",
+                jobRowMapper,
+                idempotencyKey
+        ).stream().findFirst();
+    }
+
     public List<Job> findAll() {
         return jdbcTemplate.query(
                 "SELECT * FROM jobs ORDER BY created_at DESC",
                 jobRowMapper
+        );
+    }
+
+    public List<Job> findByStatus(JobStatus status) {
+        return jdbcTemplate.query(
+                "SELECT * FROM jobs WHERE status = ? ORDER BY created_at DESC",
+                jobRowMapper,
+                status.name()
         );
     }
 
@@ -130,52 +141,13 @@ public class JobRepository {
     }
 
     /*
-     * FAILED jobs with attempts remaining were waiting out their retry
-     * delay when the application stopped. Rows with attempt_count = 0
-     * predate attempt tracking and are left alone.
-     */
-    public List<Job> findFailedJobsAwaitingRetry(int maxAttempts) {
-        return jdbcTemplate.query(
-                """
-                SELECT *
-                FROM jobs
-                WHERE status = ?
-                  AND attempt_count BETWEEN 1 AND ?
-                FOR UPDATE
-                """,
-                jobRowMapper,
-                JobStatus.FAILED.name(),
-                maxAttempts - 1
-        );
-    }
-
-    /*
-     * Atomically claim one queued job.
+     * Atomically claim the oldest queued job whose retry delay has passed.
      * SKIP LOCKED prevents concurrent workers from claiming the same row.
-     * The attempt count is incremented in the same transaction as the claim.
+     * The attempt count is incremented in the same statement as the claim.
      */
     @Transactional
     public Optional<Job> claimNextQueuedJob() {
-        List<String> ids = jdbcTemplate.query(
-                """
-                SELECT id
-                FROM jobs
-                WHERE status = ?
-                ORDER BY created_at ASC
-                LIMIT 1
-                FOR UPDATE SKIP LOCKED
-                """,
-                (rs, rowNum) -> rs.getString("id"),
-                JobStatus.QUEUED.name()
-        );
-
-        if (ids.isEmpty()) {
-            return Optional.empty();
-        }
-
-        String id = ids.get(0);
-
-        int updated = jdbcTemplate.update(
+        return jdbcTemplate.query(
                 """
                 UPDATE jobs
                 SET status = ?,
@@ -183,37 +155,146 @@ public class JobRepository {
                     completed_at = NULL,
                     failure_reason = NULL,
                     attempt_count = attempt_count + 1
-                WHERE id = ?
-                  AND status = ?
+                WHERE id = (
+                    SELECT id
+                    FROM jobs
+                    WHERE status = ?
+                      AND available_at <= NOW()
+                    ORDER BY created_at ASC
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING *
                 """,
+                jobRowMapper,
                 JobStatus.RUNNING.name(),
-                id,
                 JobStatus.QUEUED.name()
-        );
-
-        if (updated != 1) {
-            return Optional.empty();
-        }
-
-        return findById(id);
+        ).stream().findFirst();
     }
 
     /*
-     * Cancel only a job that remains queued.
+     * Locks the job's row if attemptNumber is still its current RUNNING
+     * attempt, and returns whether cancellation was requested.
+     * Empty means the attempt is stale and must not change the job.
+     */
+    public Optional<Boolean> lockRunningAttempt(String id, int attemptNumber) {
+        return jdbcTemplate.query(
+                """
+                SELECT cancel_requested
+                FROM jobs
+                WHERE id = ?
+                  AND status = ?
+                  AND attempt_count = ?
+                FOR UPDATE
+                """,
+                (rs, rowNum) -> rs.getBoolean("cancel_requested"),
+                id,
+                JobStatus.RUNNING.name(),
+                attemptNumber
+        ).stream().findFirst();
+    }
+
+    /*
+     * Moves a RUNNING job to the status decided for its attempt.
+     * A QUEUED job becomes claimable again after retryDelay.
+     */
+    public void finishRunningJob(
+            String id,
+            JobStatus status,
+            String failureReason,
+            Duration retryDelay
+    ) {
+        boolean requeued = status == JobStatus.QUEUED;
+
+        jdbcTemplate.update(
+                """
+                UPDATE jobs
+                SET status = ?,
+                    started_at = CASE WHEN ? THEN NULL ELSE started_at END,
+                    completed_at = CASE WHEN ? THEN NULL ELSE NOW() END,
+                    failure_reason = ?,
+                    available_at = CASE
+                        WHEN ? THEN NOW() + ? * INTERVAL '1 millisecond'
+                        ELSE available_at
+                    END
+                WHERE id = ?
+                  AND status = ?
+                """,
+                status.name(),
+                requeued,
+                requeued,
+                failureReason,
+                requeued,
+                requeued ? retryDelay.toMillis() : 0,
+                id,
+                JobStatus.RUNNING.name()
+        );
+    }
+
+    /*
+     * Cancel only a job that remains queued, including one
+     * waiting for its next retry.
      */
     public boolean cancelQueuedJob(String id) {
         int updated = jdbcTemplate.update(
                 """
                 UPDATE jobs
                 SET status = ?,
-                    completed_at = NOW(),
-                    failure_reason = NULL
+                    completed_at = NOW()
                 WHERE id = ?
                   AND status = ?
                 """,
                 JobStatus.CANCELLED.name(),
                 id,
                 JobStatus.QUEUED.name()
+        );
+
+        return updated == 1;
+    }
+
+    public boolean requestCancellation(String id) {
+        int updated = jdbcTemplate.update(
+                """
+                UPDATE jobs
+                SET cancel_requested = TRUE
+                WHERE id = ?
+                  AND status = ?
+                """,
+                id,
+                JobStatus.RUNNING.name()
+        );
+
+        return updated == 1;
+    }
+
+    public boolean isCancelRequested(String id) {
+        return jdbcTemplate.query(
+                "SELECT cancel_requested FROM jobs WHERE id = ?",
+                (rs, rowNum) -> rs.getBoolean("cancel_requested"),
+                id
+        ).stream().findFirst().orElse(false);
+    }
+
+    /*
+     * Gives a permanently FAILED job one more attempt.
+     * Its attempt history continues from the last attempt number.
+     */
+    public boolean retryFailedJob(String id) {
+        int updated = jdbcTemplate.update(
+                """
+                UPDATE jobs
+                SET status = ?,
+                    started_at = NULL,
+                    completed_at = NULL,
+                    available_at = NOW(),
+                    cancel_requested = FALSE,
+                    max_attempts = attempt_count + 1
+                WHERE id = ?
+                  AND status = ?
+                """,
+                JobStatus.QUEUED.name(),
+                id,
+                JobStatus.FAILED.name()
         );
 
         return updated == 1;
@@ -236,61 +317,7 @@ public class JobRepository {
         return Boolean.TRUE.equals(exists);
     }
 
-    private Timestamp toTimestamp(Instant instant) {
-        return instant != null ? Timestamp.from(instant) : null;
-    }
-
-    /*
-     * Requeue a failed job only if the database still contains
-     * the expected failed attempt.
-     */
-    public boolean requeueFailedJob(Job job) {
-        if (job == null || job.getStatus() != JobStatus.QUEUED) {
-            return false;
-        }
-
-        int updated = jdbcTemplate.update(
-                """
-                UPDATE jobs
-                SET status = ?,
-                    started_at = NULL,
-                    completed_at = NULL,
-                    failure_reason = NULL
-                WHERE id = ?
-                  AND status = ?
-                  AND attempt_count = ?
-                """,
-                JobStatus.QUEUED.name(),
-                job.getId(),
-                JobStatus.FAILED.name(),
-                job.getAttemptCount()
-        );
-
-        return updated == 1;
-    }
-
-    /*
-     * Mark an interrupted RUNNING job as FAILED after a restart.
-     */
-    public boolean recoverInterruptedJob(
-            String jobId,
-            String failureReason
-    ) {
-        int updated = jdbcTemplate.update(
-                """
-                UPDATE jobs
-                SET status = ?,
-                    completed_at = NOW(),
-                    failure_reason = ?
-                WHERE id = ?
-                  AND status = ?
-                """,
-                JobStatus.FAILED.name(),
-                failureReason,
-                jobId,
-                JobStatus.RUNNING.name()
-        );
-
-        return updated == 1;
+    private static Instant toInstant(Timestamp timestamp) {
+        return timestamp != null ? timestamp.toInstant() : null;
     }
 }

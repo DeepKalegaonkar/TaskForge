@@ -4,18 +4,25 @@ import com.taskforge.model.Job;
 import com.taskforge.model.JobStatus;
 import com.taskforge.repository.JobAttemptRepository;
 import com.taskforge.repository.JobRepository;
+import com.taskforge.scheduler.AttemptResult;
+import com.taskforge.scheduler.JobStore;
+import com.taskforge.scheduler.RetryPolicy;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.Optional;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
+import static com.taskforge.service.JobRecoveryService.RECOVERY_FAILURE_REASON;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -27,95 +34,76 @@ class JobRecoveryServiceTest {
     @Mock
     private JobAttemptRepository jobAttemptRepository;
 
-    @Test
-    void shouldCreateMissingHistoryAndRequeueInterruptedJob() {
-        Job job = interruptedJob(1);
-        JobRecoveryService recoveryService = new JobRecoveryService(
+    @Mock
+    private JobStore jobStore;
+
+    private JobRecoveryService recoveryService;
+
+    @BeforeEach
+    void setUp() {
+        recoveryService = new JobRecoveryService(
                 jobRepository,
-                jobAttemptRepository
+                jobAttemptRepository,
+                jobStore,
+                RetryPolicy.DEFAULT
         );
-
-        when(jobRepository.findAllRunningJobs()).thenReturn(List.of(job));
-        when(jobRepository.recoverInterruptedJob(
-                job.getId(),
-                "Execution interrupted by application shutdown or crash"
-        )).thenReturn(true);
-        when(jobAttemptRepository.existsByJobIdAndAttemptNumber(
-                job.getId(),
-                1
-        )).thenReturn(false);
-        when(jobRepository.requeueFailedJob(job)).thenReturn(true);
-
-        recoveryService.recoverJobs();
-
-        assertEquals(JobStatus.QUEUED, job.getStatus());
-        verify(jobAttemptRepository).recordAttemptStarted(job, 1);
-        verify(jobAttemptRepository).failInterruptedAttempt(
-                job.getId(), 1, JobRecoveryService.RECOVERY_FAILURE_REASON
-        );
-        verify(jobRepository).requeueFailedJob(job);
     }
 
     @Test
-    void shouldNotDuplicateExistingHistoryForFinalAttempt() {
-        Job job = interruptedJob(3);
-        JobRecoveryService recoveryService = new JobRecoveryService(
-                jobRepository,
-                jobAttemptRepository
-        );
+    void shouldCreateMissingHistoryAndRetryWithBackoff() {
+        Job job = interruptedJob(2, 3);
 
         when(jobRepository.findAllRunningJobs()).thenReturn(List.of(job));
-        when(jobRepository.recoverInterruptedJob(
-                job.getId(),
-                "Execution interrupted by application shutdown or crash"
-        )).thenReturn(true);
-        when(jobAttemptRepository.existsByJobIdAndAttemptNumber(
-                job.getId(),
-                3
-        )).thenReturn(true);
+        when(jobAttemptRepository.existsByJobIdAndAttemptNumber(job.getId(), 2))
+                .thenReturn(false);
+        when(jobStore.finishAttempt(any(), any()))
+                .thenReturn(Optional.of(JobStatus.QUEUED));
 
         recoveryService.recoverJobs();
 
-        assertEquals(JobStatus.FAILED, job.getStatus());
+        verify(jobAttemptRepository).recordAttemptStarted(job, 2);
+        verify(jobStore).finishAttempt(
+                job,
+                AttemptResult.failed(RECOVERY_FAILURE_REASON, Duration.ofSeconds(4))
+        );
+    }
+
+    @Test
+    void shouldNotRetryAJobOnItsFinalAttempt() {
+        Job job = interruptedJob(3, 3);
+
+        when(jobRepository.findAllRunningJobs()).thenReturn(List.of(job));
+        when(jobAttemptRepository.existsByJobIdAndAttemptNumber(job.getId(), 3))
+                .thenReturn(true);
+        when(jobStore.finishAttempt(any(), any()))
+                .thenReturn(Optional.of(JobStatus.FAILED));
+
+        recoveryService.recoverJobs();
+
         verify(jobAttemptRepository, never()).recordAttemptStarted(job, 3);
-        verify(jobAttemptRepository).failInterruptedAttempt(
-                job.getId(), 3, JobRecoveryService.RECOVERY_FAILURE_REASON
+        verify(jobStore).finishAttempt(
+                job,
+                AttemptResult.failed(RECOVERY_FAILURE_REASON, null)
         );
-        verify(jobRepository, never()).requeueFailedJob(job);
     }
 
     @Test
-    void shouldSkipJobAlreadyRecoveredByAnotherInstance() {
-        Job job = interruptedJob(1);
-        JobRecoveryService recoveryService = new JobRecoveryService(
-                jobRepository,
-                jobAttemptRepository
-        );
+    void shouldRejectARunningJobWithoutAnAttempt() {
+        Job job = interruptedJob(0, 3);
 
         when(jobRepository.findAllRunningJobs()).thenReturn(List.of(job));
-        when(jobRepository.recoverInterruptedJob(
-                job.getId(),
-                "Execution interrupted by application shutdown or crash"
-        )).thenReturn(false);
 
-        recoveryService.recoverJobs();
-
-        verifyNoInteractions(jobAttemptRepository);
-        verify(jobRepository, never()).requeueFailedJob(job);
+        assertThrows(IllegalStateException.class, recoveryService::recoverJobs);
     }
 
-    private Job interruptedJob(int attemptCount) {
-        return new Job(
-                "interrupted-job",
-                "Recovery test",
-                null,
-                () -> {},
-                Instant.parse("2026-10-28T09:00:00Z"),
-                JobStatus.RUNNING,
-                Instant.parse("2026-10-28T09:30:00Z"),
-                null,
-                null,
-                attemptCount
-        );
+    private Job interruptedJob(int attemptCount, int maxAttempts) {
+        return Job.builder("Recovery test", () -> {})
+                .id("interrupted-job")
+                .createdAt(Instant.parse("2026-10-28T09:00:00Z"))
+                .status(JobStatus.RUNNING)
+                .startedAt(Instant.parse("2026-10-28T09:30:00Z"))
+                .attemptCount(attemptCount)
+                .maxAttempts(maxAttempts)
+                .build();
     }
 }

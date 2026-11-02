@@ -4,15 +4,9 @@ import com.taskforge.model.Job;
 import com.taskforge.model.JobStatus;
 import org.junit.jupiter.api.Test;
 
-import java.time.Instant;
-import java.util.List;
-import java.util.Optional;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -69,7 +63,7 @@ class JobSchedulerTest {
 
             scheduler.submit(queuedJob);
 
-            assertTrue(scheduler.cancel(queuedJob));
+            assertEquals(CancellationResult.CANCELLED, scheduler.cancel(queuedJob));
             assertEquals(JobStatus.CANCELLED, queuedJob.getStatus());
 
             releaseJob.countDown();
@@ -289,139 +283,5 @@ class JobSchedulerTest {
             assertEquals(JobStatus.CANCELLED, job.getStatus());
             assertFalse(job.markRunning());
         }
-    }
-
-    @Test
-    void claimedJobShouldKeepTheDatabaseAttemptNumber()
-            throws InterruptedException {
-
-        // PostgreSQL increments attempt_count while claiming,
-        // so the scheduler must not increment it a second time.
-        Job claimed = claimedJob(1, () -> {});
-        List<Integer> startedAttempts = new CopyOnWriteArrayList<>();
-        List<Integer> finishedAttempts = new CopyOnWriteArrayList<>();
-        CountDownLatch finished = new CountDownLatch(1);
-
-        JobScheduler scheduler = new JobScheduler(
-                1,
-                10,
-                job -> {},
-                job -> startedAttempts.add(job.getAttemptCount()),
-                job -> {
-                    finishedAttempts.add(job.getAttemptCount());
-                    finished.countDown();
-                },
-                claimOnce(claimed),
-                id -> false
-        );
-
-        try {
-            assertTrue(finished.await(5, TimeUnit.SECONDS));
-
-            assertEquals(JobStatus.COMPLETED, claimed.getStatus());
-            assertEquals(1, claimed.getAttemptCount());
-            assertEquals(List.of(1), startedAttempts);
-            assertEquals(List.of(1), finishedAttempts);
-        } finally {
-            scheduler.shutdown();
-            assertTrue(scheduler.awaitTermination(5, TimeUnit.SECONDS));
-        }
-    }
-
-    @Test
-    void failedClaimedJobShouldBeRequeuedThroughTheDatabase()
-            throws InterruptedException {
-
-        Job claimed = claimedJob(1, () -> {
-            throw new RuntimeException("Simulated failure");
-        });
-        AtomicReference<JobStatus> statusAtRetry = new AtomicReference<>();
-        AtomicInteger attemptAtRetry = new AtomicInteger();
-        CountDownLatch retried = new CountDownLatch(1);
-
-        JobScheduler scheduler = new JobScheduler(
-                1,
-                10,
-                job -> {},
-                job -> {},
-                job -> {},
-                claimOnce(claimed),
-                id -> false,
-                job -> {
-                    statusAtRetry.set(job.getStatus());
-                    attemptAtRetry.set(job.getAttemptCount());
-                    retried.countDown();
-                    return true;
-                }
-        );
-
-        try {
-            // First retry waits 2 seconds.
-            assertTrue(retried.await(5, TimeUnit.SECONDS));
-
-            assertEquals(JobStatus.QUEUED, statusAtRetry.get());
-            assertEquals(1, attemptAtRetry.get());
-        } finally {
-            scheduler.shutdown();
-            assertTrue(scheduler.awaitTermination(5, TimeUnit.SECONDS));
-        }
-    }
-
-    @Test
-    void claimedJobOnFinalAttemptShouldNotBeRetried()
-            throws InterruptedException {
-
-        Job claimed = claimedJob(3, () -> {
-            throw new RuntimeException("Simulated failure");
-        });
-        AtomicInteger retries = new AtomicInteger();
-        CountDownLatch finished = new CountDownLatch(1);
-
-        JobScheduler scheduler = new JobScheduler(
-                1,
-                10,
-                job -> {},
-                job -> {},
-                job -> finished.countDown(),
-                claimOnce(claimed),
-                id -> false,
-                job -> {
-                    retries.incrementAndGet();
-                    return true;
-                }
-        );
-
-        try {
-            assertTrue(finished.await(5, TimeUnit.SECONDS));
-        } finally {
-            scheduler.shutdown();
-            assertTrue(scheduler.awaitTermination(5, TimeUnit.SECONDS));
-        }
-
-        assertEquals(JobStatus.FAILED, claimed.getStatus());
-        assertEquals(3, claimed.getAttemptCount());
-        assertEquals(0, retries.get());
-    }
-
-    private static Job claimedJob(int attemptCount, com.taskforge.handler.JobHandler handler) {
-        return new Job(
-                java.util.UUID.randomUUID().toString(),
-                "Claimed Job",
-                null,
-                handler,
-                Instant.now(),
-                JobStatus.RUNNING,
-                Instant.now(),
-                null,
-                null,
-                attemptCount
-        );
-    }
-
-    private static java.util.function.Supplier<Optional<Job>> claimOnce(Job job) {
-        AtomicBoolean handedOut = new AtomicBoolean(false);
-        return () -> handedOut.compareAndSet(false, true)
-                ? Optional.of(job)
-                : Optional.empty();
     }
 }

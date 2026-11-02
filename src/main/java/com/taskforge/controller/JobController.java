@@ -1,18 +1,19 @@
 package com.taskforge.controller;
 
 import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.responses.ApiResponses;
-import io.swagger.v3.oas.annotations.media.Content;
-import io.swagger.v3.oas.annotations.media.Schema;
 import com.taskforge.dto.JobResponse;
 import com.taskforge.dto.SubmitJobRequest;
-import com.taskforge.handler.JobHandlerFactory;
-import com.taskforge.model.Job;
 import com.taskforge.model.JobAttempt;
+import com.taskforge.model.JobStatus;
+import com.taskforge.scheduler.CancellationResult;
 import com.taskforge.service.JobService;
+import com.taskforge.service.JobService.SubmitResult;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.server.ResponseStatusException;
 
@@ -22,14 +23,14 @@ import java.util.List;
 @RequestMapping("/api/jobs")
 public class JobController {
 
-    private final JobService jobService;
-    private final JobHandlerFactory handlerFactory;
+    static final String IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
+    static final String REPLAYED_HEADER = "Idempotent-Replayed";
+    private static final int MAX_IDEMPOTENCY_KEY_LENGTH = 100;
 
-    public JobController(
-            JobService jobService,
-            JobHandlerFactory handlerFactory) {
+    private final JobService jobService;
+
+    public JobController(JobService jobService) {
         this.jobService = jobService;
-        this.handlerFactory = handlerFactory;
     }
 
     @Operation(
@@ -48,26 +49,46 @@ public class JobController {
 
     @Operation(
             summary = "Submit a job",
-            description = "Submits a predefined job for asynchronous execution."
+            description = """
+                    Submits a predefined job for asynchronous execution.
+                    Send an Idempotency-Key header to make retries of this
+                    request safe: repeating it returns the original job.
+                    """
     )
     @ApiResponses({
             @ApiResponse(responseCode = "202", description = "Job accepted"),
+            @ApiResponse(responseCode = "200", description = "Repeated request; the original job is returned"),
             @ApiResponse(responseCode = "400", description = "Invalid request"),
-            @ApiResponse(responseCode = "409", description = "Job queue unavailable or full")
+            @ApiResponse(responseCode = "409", description = "Scheduler is shutting down"),
+            @ApiResponse(responseCode = "422", description = "Idempotency key reused with a different request")
     })
 
     @PostMapping
-    @ResponseStatus(HttpStatus.ACCEPTED)
-    public JobResponse submitJob(
+    public ResponseEntity<JobResponse> submitJob(
+            @Parameter(description = "Client-chosen key, at most 100 characters, identifying this submission")
+            @RequestHeader(value = IDEMPOTENCY_KEY_HEADER, required = false)
+            String idempotencyKey,
             @Valid @RequestBody SubmitJobRequest request) {
 
-        Job job = new Job(
-                request.name(),
-                request.type(),
-                handlerFactory.createHandler(request.type())
-        );
+        if (idempotencyKey != null
+                && (idempotencyKey.isBlank()
+                        || idempotencyKey.length() > MAX_IDEMPOTENCY_KEY_LENGTH)) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST,
+                    "Idempotency-Key must be between 1 and "
+                            + MAX_IDEMPOTENCY_KEY_LENGTH + " characters."
+            );
+        }
 
-        return JobResponse.from(jobService.submitJob(job));
+        SubmitResult result = jobService.submitJob(request, idempotencyKey);
+        JobResponse body = JobResponse.from(result.job());
+
+        if (result.replayed()) {
+            return ResponseEntity.ok()
+                    .header(REPLAYED_HEADER, "true")
+                    .body(body);
+        }
+        return ResponseEntity.status(HttpStatus.ACCEPTED).body(body);
     }
 
     @Operation(
@@ -83,10 +104,7 @@ public class JobController {
     public JobResponse getJob(@PathVariable String id) {
         return jobService.getJobById(id)
                 .map(JobResponse::from)
-                .orElseThrow(() -> new ResponseStatusException(
-                        HttpStatus.NOT_FOUND,
-                        "Job not found: " + id
-                ));
+                .orElseThrow(() -> notFound(id));
     }
 
     @Operation(
@@ -101,57 +119,95 @@ public class JobController {
     @GetMapping("/{id}/attempts")
     public List<JobAttempt> getJobAttempts(@PathVariable String id) {
         return jobService.getAttempts(id)
-                .orElseThrow(() -> new ResponseStatusException(
-                        HttpStatus.NOT_FOUND,
-                        "Job not found: " + id
-                ));
+                .orElseThrow(() -> notFound(id));
     }
 
     @Operation(
-            summary = "List all jobs",
-            description = "Returns all jobs stored in the database, newest first."
+            summary = "List jobs",
+            description = """
+                    Returns jobs stored in the database, newest first.
+                    Use status=FAILED to list permanently failed jobs.
+                    """
     )
-    @ApiResponse(
-            responseCode = "200",
-            description = "Jobs retrieved successfully"
-    )
+    @ApiResponses({
+            @ApiResponse(responseCode = "200", description = "Jobs retrieved successfully"),
+            @ApiResponse(responseCode = "400", description = "Unknown status")
+    })
 
     @GetMapping
-    public List<JobResponse> getAllJobs() {
-        return jobService.getAllJobs()
+    public List<JobResponse> getAllJobs(
+            @RequestParam(required = false) JobStatus status) {
+        return (status == null
+                ? jobService.getAllJobs()
+                : jobService.getJobsByStatus(status))
                 .stream()
                 .map(JobResponse::from)
                 .toList();
     }
 
     @Operation(
-            summary = "Cancel a queued job",
-            description = "Cancels a job only if it has not started executing."
+            summary = "Retry a permanently failed job",
+            description = """
+                    Requeues a FAILED job for one more attempt.
+                    Its attempt history continues from the last attempt.
+                    """
+    )
+    @ApiResponses({
+            @ApiResponse(responseCode = "202", description = "Job requeued"),
+            @ApiResponse(responseCode = "404", description = "Job not found"),
+            @ApiResponse(responseCode = "409", description = "Job is not FAILED")
+    })
+
+    @PostMapping("/{id}/retry")
+    @ResponseStatus(HttpStatus.ACCEPTED)
+    public JobResponse retryJob(@PathVariable String id) {
+        return jobService.retryFailedJob(id)
+                .map(JobResponse::from)
+                .orElseThrow(() -> {
+                    if (jobService.getJobById(id).isEmpty()) {
+                        return notFound(id);
+                    }
+                    return new ResponseStatusException(
+                            HttpStatus.CONFLICT,
+                            "Only FAILED jobs can be retried"
+                    );
+                });
+    }
+
+    @Operation(
+            summary = "Cancel a job",
+            description = """
+                    Cancels a queued job immediately, including one waiting
+                    to retry. A running job is interrupted and becomes
+                    CANCELLED shortly afterwards.
+                    """
     )
     @ApiResponses({
             @ApiResponse(responseCode = "204", description = "Job cancelled"),
+            @ApiResponse(responseCode = "202", description = "Running job is being cancelled"),
             @ApiResponse(responseCode = "404", description = "Job not found"),
-            @ApiResponse(responseCode = "409", description = "Job cannot be cancelled")
+            @ApiResponse(responseCode = "409", description = "Job has already finished")
     })
 
     @DeleteMapping("/{id}")
-    @ResponseStatus(HttpStatus.NO_CONTENT)
-    public void cancelJob(@PathVariable String id) {
-        boolean cancelled = jobService.cancelJob(id);
+    public ResponseEntity<Void> cancelJob(@PathVariable String id) {
+        CancellationResult result = jobService.cancelJob(id);
 
-        if (!cancelled) {
-            if (jobService.getJobById(id).isEmpty()) {
-                throw new ResponseStatusException(
-                        HttpStatus.NOT_FOUND,
-                        "Job not found: " + id
-                );
-            }
-
-            throw new ResponseStatusException(
+        return switch (result) {
+            case CANCELLED -> ResponseEntity.noContent().build();
+            case CANCELLATION_REQUESTED -> ResponseEntity.accepted().build();
+            case NOT_FOUND -> throw notFound(id);
+            case NOT_CANCELLABLE -> throw new ResponseStatusException(
                     HttpStatus.CONFLICT,
-                    "Job cannot be cancelled because it may already be running or finished"
+                    "Job cannot be cancelled because it has already finished"
             );
-        }
+        };
     }
 
+    private static ResponseStatusException notFound(String id) {
+        return new ResponseStatusException(
+                HttpStatus.NOT_FOUND,
+                "Job not found: " + id
+        );
+    }
 }

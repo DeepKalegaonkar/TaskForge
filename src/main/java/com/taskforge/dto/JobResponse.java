@@ -13,10 +13,15 @@ public record JobResponse(
         JobType type,
         JobStatus status,
         int attemptCount,
+        int maxAttempts,
+        long timeoutSeconds,
         Instant createdAt,
         Instant startedAt,
         Instant completedAt,
-        String failureReason
+        Instant nextAttemptAt,
+        boolean cancelRequested,
+        String failureReason,
+        String idempotencyKey
 ) {
     public static JobResponse from(Job job) {
         return new JobResponse(
@@ -25,10 +30,15 @@ public record JobResponse(
                 job.getType(),
                 job.getStatus(),
                 job.getAttemptCount(),
+                job.getMaxAttempts(),
+                job.getTimeout().toSeconds(),
                 job.getCreatedAt(),
                 job.getStartedAt(),
                 job.getCompletedAt(),
-                job.getFailureReason()
+                job.getNextAttemptAt(),
+                job.isCancelRequested(),
+                job.getFailureReason(),
+                job.getIdempotencyKey()
         );
     }
 }

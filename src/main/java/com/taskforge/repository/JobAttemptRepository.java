@@ -97,34 +97,6 @@ public class JobAttemptRepository {
         return Boolean.TRUE.equals(exists);
     }
 
-    /**
-     * Finishes an interrupted attempt only if it is still RUNNING.
-     */
-    public boolean failInterruptedAttempt(
-            String jobId,
-            int attemptNumber,
-            String failureReason
-    ) {
-        int updated = jdbcTemplate.update(
-                """
-                UPDATE job_attempts
-                SET status = ?,
-                    completed_at = NOW(),
-                    failure_reason = ?
-                WHERE job_id = ?
-                  AND attempt_number = ?
-                  AND status = ?
-                """,
-                JobStatus.FAILED.name(),
-                failureReason,
-                jobId,
-                attemptNumber,
-                JobStatus.RUNNING.name()
-        );
-
-        return updated == 1;
-    }
-
     public List<JobAttempt> findByJobId(String jobId) {
         return jdbcTemplate.query(
                 """
