@@ -4,6 +4,7 @@ package com.taskforge;
 import com.taskforge.handler.JobHandler;
 import com.taskforge.model.Job;
 import com.taskforge.model.JobStatus;
+import com.taskforge.scheduler.CancellationResult;
 import com.taskforge.scheduler.JobScheduler;
 
 import java.util.concurrent.TimeUnit;
@@ -32,9 +33,9 @@ public class Main {
 
         scheduler.submit(queuedJob);
 
-        boolean cancelled = scheduler.cancel(queuedJob);
+        CancellationResult cancelled = scheduler.cancel(queuedJob);
 
-        System.out.println("Cancellation successful: " + cancelled);
+        System.out.println("Cancellation result: " + cancelled);
         System.out.println("Queued job status: " + queuedJob.getStatus());
 
         scheduler.shutdown();

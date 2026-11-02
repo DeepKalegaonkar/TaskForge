@@ -145,6 +145,170 @@ class JobControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$").isEmpty());
     }
+
+    @Test
+    void repeatingASubmissionWithTheSameIdempotencyKeyReturnsTheOriginalJob()
+            throws Exception {
+        String key = java.util.UUID.randomUUID().toString();
+        String request = """
+                {
+                    "name": "Test Report",
+                    "type": "GENERATE_REPORT"
+                }
+                """;
+
+        String first = mockMvc.perform(post("/api/jobs")
+                        .header("Idempotency-Key", key)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(request))
+                .andExpect(status().isAccepted())
+                .andExpect(header().doesNotExist("Idempotent-Replayed"))
+                .andExpect(jsonPath("$.idempotencyKey").value(key))
+                .andReturn().getResponse().getContentAsString();
+
+        String id = com.jayway.jsonpath.JsonPath.read(first, "$.id");
+
+        mockMvc.perform(post("/api/jobs")
+                        .header("Idempotency-Key", key)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(request))
+                .andExpect(status().isOk())
+                .andExpect(header().string("Idempotent-Replayed", "true"))
+                .andExpect(jsonPath("$.id").value(id));
+
+        Integer jobsWithKey = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM jobs WHERE idempotency_key = ?",
+                Integer.class, key
+        );
+        org.junit.jupiter.api.Assertions.assertEquals(1, jobsWithKey);
+    }
+
+    @Test
+    void reusingAnIdempotencyKeyForADifferentRequestIsRejected()
+            throws Exception {
+        String key = java.util.UUID.randomUUID().toString();
+
+        mockMvc.perform(post("/api/jobs")
+                        .header("Idempotency-Key", key)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                            { "name": "Test Report", "type": "GENERATE_REPORT" }
+                            """))
+                .andExpect(status().isAccepted());
+
+        mockMvc.perform(post("/api/jobs")
+                        .header("Idempotency-Key", key)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                            { "name": "Test Report", "type": "SEND_EMAIL" }
+                            """))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.status").value(422));
+    }
+
+    @Test
+    void blankIdempotencyKeyIsRejected() throws Exception {
+        mockMvc.perform(post("/api/jobs")
+                        .header("Idempotency-Key", " ")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                            { "name": "Test Report", "type": "GENERATE_REPORT" }
+                            """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.status").value(400));
+    }
+
+    @Test
+    void retryAndTimeoutSettingsAreAppliedAndValidated() throws Exception {
+        mockMvc.perform(post("/api/jobs")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                            {
+                                "name": "Test Report",
+                                "type": "GENERATE_REPORT",
+                                "maxAttempts": 5,
+                                "timeoutSeconds": 120
+                            }
+                            """))
+                .andExpect(status().isAccepted())
+                .andExpect(jsonPath("$.maxAttempts").value(5))
+                .andExpect(jsonPath("$.timeoutSeconds").value(120));
+
+        mockMvc.perform(post("/api/jobs")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                            {
+                                "name": "Test Report",
+                                "type": "GENERATE_REPORT",
+                                "maxAttempts": 0
+                            }
+                            """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.message")
+                        .value("Max attempts must be between 1 and 10."));
+    }
+
+    @Test
+    void defaultsApplyWhenSettingsAreOmitted() throws Exception {
+        mockMvc.perform(post("/api/jobs")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                            { "name": "Test Report", "type": "GENERATE_REPORT" }
+                            """))
+                .andExpect(status().isAccepted())
+                .andExpect(jsonPath("$.maxAttempts").value(3))
+                .andExpect(jsonPath("$.timeoutSeconds").value(30));
+    }
+
+    @Test
+    void jobsCanBeFilteredByStatus() throws Exception {
+        mockMvc.perform(get("/api/jobs").param("status", "FAILED"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[*].status").value(
+                        org.hamcrest.Matchers.everyItem(
+                                org.hamcrest.Matchers.is("FAILED"))
+                ));
+
+        mockMvc.perform(get("/api/jobs").param("status", "NOT_A_STATUS"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.message")
+                        .value("Invalid value for parameter 'status'."));
+    }
+
+    @Test
+    void onlyFailedJobsCanBeRetried() throws Exception {
+        String body = mockMvc.perform(post("/api/jobs")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                            { "name": "Test Report", "type": "GENERATE_REPORT" }
+                            """))
+                .andReturn().getResponse().getContentAsString();
+        String id = com.jayway.jsonpath.JsonPath.read(body, "$.id");
+
+        mockMvc.perform(post("/api/jobs/" + id + "/retry"))
+                .andExpect(status().isConflict());
+
+        mockMvc.perform(post("/api/jobs/nonexistent-job-id/retry"))
+                .andExpect(status().isNotFound());
+    }
+
+    @Test
+    void queuedJobIsCancelledOnlyOnce() throws Exception {
+        String body = mockMvc.perform(post("/api/jobs")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                            { "name": "Test Report", "type": "GENERATE_REPORT" }
+                            """))
+                .andReturn().getResponse().getContentAsString();
+        String id = com.jayway.jsonpath.JsonPath.read(body, "$.id");
+
+        mockMvc.perform(delete("/api/jobs/" + id))
+                .andExpect(status().isNoContent());
+
+        mockMvc.perform(get("/api/jobs/" + id))
+                .andExpect(jsonPath("$.status").value("CANCELLED"));
+
+        mockMvc.perform(delete("/api/jobs/" + id))
+                .andExpect(status().isConflict());
+    }
 }
-
-

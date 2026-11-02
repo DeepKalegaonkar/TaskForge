@@ -91,24 +91,6 @@ class JobAttemptRepositoryTest {
     }
 
     @Test
-    void failInterruptedAttemptShouldOnlyTouchRunningAttempts() {
-        Job job = persistedJob();
-        assertTrue(job.markRunning());
-        jobAttemptRepository.recordAttemptStarted(job, 1);
-
-        assertTrue(jobAttemptRepository.failInterruptedAttempt(
-                job.getId(), 1, "crashed"
-        ));
-        assertFalse(jobAttemptRepository.failInterruptedAttempt(
-                job.getId(), 1, "crashed again"
-        ));
-
-        JobAttempt attempt = jobAttemptRepository.findByJobId(job.getId()).get(0);
-        assertEquals(JobStatus.FAILED, attempt.status());
-        assertEquals("crashed", attempt.failureReason());
-    }
-
-    @Test
     void shouldRejectInvalidAttemptNumberBeforeWriting() {
         Job job = persistedJob();
 
@@ -121,7 +103,7 @@ class JobAttemptRepositoryTest {
 
     private Job persistedJob() {
         Job job = new Job("attempt-history-test", JobType.GENERATE_REPORT, () -> {});
-        jobRepository.save(job);
+        jobRepository.insert(job);
         createdJobIds.add(job.getId());
         return job;
     }

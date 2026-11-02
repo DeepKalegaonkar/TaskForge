@@ -1,46 +1,41 @@
 package com.taskforge.config;
 
-import com.taskforge.model.JobStatus;
-import com.taskforge.repository.JobAttemptRepository;
-import com.taskforge.repository.JobRepository;
 import com.taskforge.scheduler.JobScheduler;
+import com.taskforge.scheduler.JobStore;
+import com.taskforge.scheduler.RetryPolicy;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+
+import java.time.Duration;
 
 @Configuration
 public class JobExecutionConfig {
 
-    @Bean(destroyMethod = "shutdown")
+    @Bean
+    public RetryPolicy retryPolicy(
+            @Value("${taskforge.retry.initial-delay:2s}") Duration initialDelay,
+            @Value("${taskforge.retry.multiplier:2.0}") double multiplier,
+            @Value("${taskforge.retry.max-delay:5m}") Duration maxDelay
+    ) {
+        return new RetryPolicy(initialDelay, multiplier, maxDelay);
+    }
+
+    // Workers start in SchedulerStartup, after recovery. On shutdown,
+    // close() lets running jobs finish within the grace period.
+    @Bean(destroyMethod = "close")
     public JobScheduler jobScheduler(
-            JobRepository jobRepository,
-            JobAttemptRepository jobAttemptRepository
+            JobStore jobStore,
+            RetryPolicy retryPolicy,
+            @Value("${taskforge.scheduler.workers:2}") int workers,
+            @Value("${taskforge.scheduler.shutdown-grace-period:20s}")
+            Duration shutdownGracePeriod
     ) {
         return new JobScheduler(
-                2,
-                100,
-                jobRepository::save,
-
-                // Record the actual attempt number.
-                job -> jobAttemptRepository.recordAttemptStarted(
-                        job,
-                        job.getAttemptCount()
-                ),
-
-                // Record each completed or failed attempt.
-                job -> {
-                    if (job.getStatus() == JobStatus.COMPLETED
-                            || job.getStatus() == JobStatus.FAILED) {
-                        jobAttemptRepository.recordAttemptFinished(
-                                job,
-                                job.getAttemptCount()
-                        );
-                    }
-                },
-
-                jobRepository::claimNextQueuedJob,
-                jobRepository::cancelQueuedJob,
-                jobRepository::requeueFailedJob,
-
+                workers,
+                jobStore,
+                retryPolicy,
+                shutdownGracePeriod,
                 false
         );
     }
