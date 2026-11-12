@@ -10,7 +10,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
+import com.taskforge.support.PostgresIntegrationTest;
 import org.springframework.jdbc.core.JdbcTemplate;
 
 import java.util.List;
@@ -24,8 +24,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Each test writes the rows a crash at a particular point would leave
  * behind, then runs startup recovery against PostgreSQL.
  */
-@SpringBootTest
-class JobRecoveryIntegrationTest {
+class JobRecoveryIntegrationTest extends PostgresIntegrationTest {
 
     @Autowired
     private JobRecoveryService recoveryService;

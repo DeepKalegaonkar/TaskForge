@@ -6,7 +6,7 @@ import com.taskforge.service.JobService.SubmitResult;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
+import com.taskforge.support.PostgresIntegrationTest;
 import org.springframework.jdbc.core.JdbcTemplate;
 
 import java.util.ArrayList;
@@ -22,8 +22,7 @@ import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
-@SpringBootTest
-class JobSubmissionIdempotencyTest {
+class JobSubmissionIdempotencyTest extends PostgresIntegrationTest {
 
     private static final int CONCURRENT_REQUESTS = 8;
 

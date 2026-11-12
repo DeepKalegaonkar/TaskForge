@@ -7,7 +7,7 @@ import com.taskforge.model.JobStatus;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
+import com.taskforge.support.PostgresIntegrationTest;
 import org.springframework.jdbc.core.JdbcTemplate;
 
 import java.util.ArrayList;
@@ -20,8 +20,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-@SpringBootTest
-class JobAttemptRepositoryTest {
+class JobAttemptRepositoryTest extends PostgresIntegrationTest {
 
     @Autowired
     private JobRepository jobRepository;
