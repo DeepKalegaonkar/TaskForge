@@ -7,6 +7,8 @@ import com.taskforge.repository.JobRepository;
 import com.taskforge.scheduler.AttemptResult;
 import com.taskforge.scheduler.JobStore;
 import com.taskforge.scheduler.RetryPolicy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -21,6 +23,8 @@ import java.util.Optional;
  */
 @Service
 public class JobRecoveryService {
+
+    private static final Logger log = LoggerFactory.getLogger(JobRecoveryService.class);
 
     static final String RECOVERY_FAILURE_REASON =
             "Execution interrupted by application shutdown or crash";
@@ -44,11 +48,14 @@ public class JobRecoveryService {
 
     @Transactional
     public void recoverJobs() {
-        for (Job job : jobRepository.findAllRunningJobs()) {
+        var interrupted = jobRepository.findAllRunningJobs();
+
+        for (Job job : interrupted) {
             recoverRunningJob(job);
         }
 
-        System.out.println("Startup job recovery completed.");
+        log.info("Startup job recovery completed; {} interrupted job(s) recovered",
+                interrupted.size());
     }
 
     private void recoverRunningJob(Job job) {
@@ -81,11 +88,9 @@ public class JobRecoveryService {
                 AttemptResult.failed(RECOVERY_FAILURE_REASON, retryDelay)
         );
 
-        recoveredStatus.ifPresent(status -> System.out.println(
-                "Recovered job " + job.getId()
-                        + "; attempt " + attemptNumber + " of "
-                        + job.getMaxAttempts() + " failed. Job is now "
-                        + status + "."
+        recoveredStatus.ifPresent(status -> log.warn(
+                "Recovered interrupted job {}; attempt {} of {} marked FAILED, job is now {}",
+                job.getId(), attemptNumber, job.getMaxAttempts(), status
         ));
     }
 }

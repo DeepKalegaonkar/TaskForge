@@ -10,11 +10,20 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
         info = @Info(
                 title = "TaskForge API",
                 version = "1.0.0",
-                description =  """
-                        TaskForge is a Java-based background job scheduling
-                        system. It supports submitting jobs, monitoring their
-                        execution status, and cancelling jobs that are still
-                        queued.
+                description = """
+                        TaskForge is a PostgreSQL-backed background job scheduler.
+                        Submit a job and it is executed asynchronously by a pool
+                        of workers, with per-job timeouts, retries with
+                        exponential backoff, cancellation of queued and running
+                        jobs, crash recovery on startup and idempotent
+                        submission via the `Idempotency-Key` header.
+
+                        Execution is at least once: a job can run again if its
+                        process dies after the handler finished but before the
+                        result was committed.
+
+                        Health probes: `/actuator/health/liveness` and
+                        `/actuator/health/readiness`.
                         """
         )
 )

@@ -35,7 +35,11 @@ public class JobController {
 
     @Operation(
             summary = "Check API health",
-            description = "Checks whether the TaskForge API is responding."
+            description = """
+                    Checks whether the HTTP API is responding. For probes,
+                    use /actuator/health/readiness, which also checks the
+                    database and the worker pool.
+                    """
     )
     @ApiResponse(
             responseCode = "200",

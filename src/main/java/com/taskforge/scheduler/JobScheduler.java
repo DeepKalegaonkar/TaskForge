@@ -3,6 +3,9 @@ package com.taskforge.scheduler;
 import com.taskforge.handler.NonRetryableJobException;
 import com.taskforge.model.Job;
 import com.taskforge.model.JobStatus;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 
 import java.time.Duration;
 import java.util.Map;
@@ -32,6 +35,13 @@ import java.util.function.Consumer;
  * job's timeout and react to cancellation while it waits.
  */
 public class JobScheduler implements AutoCloseable {
+
+    private static final Logger log = LoggerFactory.getLogger(JobScheduler.class);
+
+    // MDC keys. They appear as fields in structured (JSON) log output.
+    static final String MDC_JOB_ID = "jobId";
+    static final String MDC_JOB_NAME = "jobName";
+    static final String MDC_ATTEMPT = "attempt";
 
     public static final String SHUTDOWN_REASON =
             "Interrupted by application shutdown";
@@ -317,9 +327,8 @@ public class JobScheduler implements AutoCloseable {
                 Thread.currentThread().interrupt();
                 break;
             } catch (RuntimeException e) {
-                System.err.println(
-                        "Database job claiming failed: " + e.getMessage()
-                );
+                log.warn("Database job claiming failed; retrying in 1 s: {}",
+                        e.getMessage());
 
                 try {
                     TimeUnit.MILLISECONDS.sleep(1000);
@@ -345,14 +354,38 @@ public class JobScheduler implements AutoCloseable {
             notifyStatusChanged(job);
         }
 
-        Outcome outcome = runAttempt(job);
-        finishAttempt(job, outcome);
+        MDC.put(MDC_JOB_ID, job.getId());
+        MDC.put(MDC_JOB_NAME, job.getName());
+        MDC.put(MDC_ATTEMPT, String.valueOf(job.getAttemptCount()));
+        try {
+            log.info("Job started (attempt {} of {})",
+                    job.getAttemptCount(), job.getMaxAttempts());
+            long startedAt = System.nanoTime();
+
+            Outcome outcome = runAttempt(job);
+            finishAttempt(job, outcome,
+                    Duration.ofNanos(System.nanoTime() - startedAt));
+        } finally {
+            MDC.remove(MDC_JOB_ID);
+            MDC.remove(MDC_JOB_NAME);
+            MDC.remove(MDC_ATTEMPT);
+        }
     }
 
     private Outcome runAttempt(Job job) {
+        // Handlers run on another thread; carry the job's log context over.
+        Map<String, String> logContext = MDC.getCopyOfContextMap();
+
         FutureTask<Void> execution = new FutureTask<>(() -> {
-            job.getHandler().execute();
-            return null;
+            if (logContext != null) {
+                MDC.setContextMap(logContext);
+            }
+            try {
+                job.getHandler().execute();
+                return null;
+            } finally {
+                MDC.clear();
+            }
         });
 
         runningJobs.put(job.getId(), new RunningJob(job, execution));
@@ -428,15 +461,13 @@ public class JobScheduler implements AutoCloseable {
         try {
             return jobStore.isCancelRequested(job.getId());
         } catch (RuntimeException e) {
-            System.err.println(
-                    "Could not check cancellation for " + job.getId()
-                            + ": " + e.getMessage()
-            );
+            log.warn("Could not check cancellation for job {}: {}",
+                    job.getId(), e.getMessage());
             return false;
         }
     }
 
-    private void finishAttempt(Job job, Outcome outcome) {
+    private void finishAttempt(Job job, Outcome outcome, Duration elapsed) {
         switch (outcome.status()) {
             case COMPLETED -> job.markCompleted();
             case CANCELLED -> job.markCancelledWhileRunning();
@@ -448,7 +479,7 @@ public class JobScheduler implements AutoCloseable {
                 outcome.status(), outcome.reason(), retryDelay
         );
 
-        logOutcome(job, result);
+        logOutcome(job, result, elapsed);
 
         if (isDatabaseBacked()) {
             recordInStore(job, result);
@@ -492,19 +523,16 @@ public class JobScheduler implements AutoCloseable {
 
         try {
             if (jobStore.finishAttempt(job, result).isEmpty()) {
-                System.err.println(
-                        "Discarded stale result for job " + job.getId()
-                                + " attempt " + job.getAttemptCount()
-                                + "; the job was already recovered elsewhere"
-                );
+                log.warn("Discarded stale result for job {} attempt {}; "
+                                + "the job was already recovered elsewhere",
+                        job.getId(), job.getAttemptCount());
             }
         } catch (RuntimeException e) {
             // The job stays RUNNING in the database and is
             // recovered on the next startup.
-            System.err.println(
-                    "Could not record attempt result for " + job.getId()
-            );
-            e.printStackTrace();
+            log.error("Could not record attempt result for job {}; "
+                    + "it stays RUNNING until the next startup recovery",
+                    job.getId(), e);
         } finally {
             if (interrupted) {
                 Thread.currentThread().interrupt();
@@ -521,9 +549,8 @@ public class JobScheduler implements AutoCloseable {
                 }
 
                 if (!jobQueue.offer(job)) {
-                    System.err.println(
-                            "Retry queue is full for job " + job.getId()
-                    );
+                    log.error("Retry queue is full; dropping retry of job {}",
+                            job.getId());
                 }
             }, delay.toMillis(), TimeUnit.MILLISECONDS);
         } catch (RejectedExecutionException e) {
@@ -531,32 +558,28 @@ public class JobScheduler implements AutoCloseable {
         }
     }
 
-    private void logOutcome(Job job, AttemptResult result) {
-        if (result.status() != JobStatus.FAILED) {
-            return;
-        }
+    private void logOutcome(Job job, AttemptResult result, Duration elapsed) {
+        long ms = elapsed.toMillis();
 
-        System.err.println(
-                "Job failed: " + job.getName()
-                        + " (attempt " + job.getAttemptCount()
-                        + " of " + job.getMaxAttempts() + "): "
-                        + result.failureReason()
-        );
-
-        if (result.willRetry()) {
-            System.out.println(
-                    "Retrying job " + job.getId()
-                            + " after " + result.retryDelay().toMillis() + " ms"
-            );
-        } else if (!job.hasAttemptsRemaining()) {
-            System.err.println(
-                    "Job exhausted all " + job.getMaxAttempts()
-                            + " attempts: " + job.getId()
-            );
-        } else if (!job.isCancelRequested()) {
-            System.err.println(
-                    "Job failed permanently: " + job.getId()
-            );
+        switch (result.status()) {
+            case COMPLETED -> log.info("Job completed in {} ms", ms);
+            case CANCELLED -> log.info("Job cancelled after {} ms", ms);
+            default -> {
+                if (result.willRetry()) {
+                    log.warn("Job attempt {} of {} failed after {} ms: {}; "
+                                    + "retrying in {} ms",
+                            job.getAttemptCount(), job.getMaxAttempts(), ms,
+                            result.failureReason(),
+                            result.retryDelay().toMillis());
+                } else if (!job.hasAttemptsRemaining()) {
+                    log.error("Job failed permanently after exhausting "
+                                    + "all {} attempts: {}",
+                            job.getMaxAttempts(), result.failureReason());
+                } else if (!job.isCancelRequested()) {
+                    log.error("Job failed permanently (not retryable): {}",
+                            result.failureReason());
+                }
+            }
         }
     }
 
@@ -568,10 +591,7 @@ public class JobScheduler implements AutoCloseable {
         try {
             statusChangeListener.accept(job);
         } catch (RuntimeException e) {
-            System.err.println(
-                    "Status listener failed for " + job.getId()
-            );
-            e.printStackTrace();
+            log.error("Status listener failed for job {}", job.getId(), e);
         }
     }
 
@@ -608,11 +628,8 @@ public class JobScheduler implements AutoCloseable {
                 return;
             }
 
-            System.out.println(
-                    "Interrupting " + runningJobs.size()
-                            + " job(s) still running after "
-                            + describe(gracePeriod)
-            );
+            log.warn("Interrupting {} job(s) still running after {}",
+                    runningJobs.size(), describe(gracePeriod));
 
             forcedShutdown = true;
             runningJobs.values()
@@ -643,6 +660,19 @@ public class JobScheduler implements AutoCloseable {
 
     public int getRunningJobCount() {
         return runningJobs.size();
+    }
+
+    public int getWorkerCount() {
+        return workerCount;
+    }
+
+    // True once start() has run and until shutdown begins.
+    public boolean isRunning() {
+        return workersStarted.get() && acceptingJobs.get();
+    }
+
+    public boolean isShuttingDown() {
+        return !acceptingJobs.get();
     }
 
     private static String describe(Duration duration) {
