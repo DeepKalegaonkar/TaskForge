@@ -1,6 +1,8 @@
 package com.taskforge.handler;
 
 import com.taskforge.dto.SubmitJobRequest.JobType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
@@ -8,29 +10,31 @@ import java.time.Duration;
 @Component
 public class JobHandlerFactory {
 
+    private static final Logger log = LoggerFactory.getLogger(JobHandlerFactory.class);
+
     static final Duration SLOW_JOB_DURATION = Duration.ofSeconds(15);
 
     public JobHandler createHandler(JobType type) {
         return switch (type) {
             case GENERATE_REPORT -> () -> {
-                System.out.println("Generating report...");
-                System.out.println("Report generation finished.");
+                log.info("Generating report...");
+                log.info("Report generation finished.");
             };
 
             case SEND_EMAIL -> () -> {
-                System.out.println("Sending email...");
-                System.out.println("Email sending finished.");
+                log.info("Sending email...");
+                log.info("Email sending finished.");
             };
 
             case FAIL_FOR_TESTING -> () -> {
-                System.out.println("Running deliberate failure test...");
+                log.info("Running deliberate failure test...");
                 throw new RuntimeException(
                         "Deliberate failure for retry testing"
                 );
             };
 
             case FAIL_PERMANENTLY_FOR_TESTING -> () -> {
-                System.out.println("Running deliberate permanent failure test...");
+                log.info("Running deliberate permanent failure test...");
                 throw new NonRetryableJobException(
                         "Deliberate permanent failure for testing"
                 );
@@ -38,9 +42,9 @@ public class JobHandlerFactory {
 
             // Long enough to exercise timeouts, cancellation and shutdown.
             case SLOW_FOR_TESTING -> () -> {
-                System.out.println("Running slow job...");
+                log.info("Running slow job...");
                 Thread.sleep(SLOW_JOB_DURATION.toMillis());
-                System.out.println("Slow job finished.");
+                log.info("Slow job finished.");
             };
         };
     }

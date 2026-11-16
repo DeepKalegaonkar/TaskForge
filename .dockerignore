@@ -1,0 +1,4 @@
+# Only pom.xml and src/ are needed to build the image.
+*
+!pom.xml
+!src

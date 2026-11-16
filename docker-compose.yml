@@ -1,0 +1,52 @@
+# TaskForge + PostgreSQL.
+#
+#   docker compose up --build -d --wait   # build, start, wait until healthy
+#   ./scripts/demo.sh                     # walk through the features
+#   docker compose logs -f app            # structured JSON logs
+#   docker compose down -v                # stop and delete the data
+#
+# The API is published on http://localhost:8080 (Swagger UI at
+# /swagger-ui.html). PostgreSQL is not published to the host, so it cannot
+# clash with a local installation; use `docker compose exec postgres psql
+# -U taskforge` to inspect it.
+
+name: taskforge
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: taskforge
+      POSTGRES_USER: taskforge
+      POSTGRES_PASSWORD: ${TASKFORGE_DB_PASSWORD:-TaskForgeDev_2026}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taskforge -d taskforge"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    image: taskforge:local
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/taskforge
+      SPRING_DATASOURCE_USERNAME: taskforge
+      TASKFORGE_DB_PASSWORD: ${TASKFORGE_DB_PASSWORD:-TaskForgeDev_2026}
+      TASKFORGE_SCHEDULER_WORKERS: ${TASKFORGE_WORKERS:-4}
+      # One JSON object per log line (Elastic Common Schema).
+      LOGGING_STRUCTURED_FORMAT_CONSOLE: ecs
+    ports:
+      - "${TASKFORGE_PORT:-8080}:8080"
+    # Longer than taskforge.scheduler.shutdown-grace-period (20 s), so that
+    # `docker compose stop` lets running jobs finish before SIGKILL.
+    stop_grace_period: 30s
+    # Deliberately no restart policy: the demo kills the container to show
+    # crash recovery and restarts it explicitly.
+
+volumes:
+  db-data:
