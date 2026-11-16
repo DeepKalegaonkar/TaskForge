@@ -78,6 +78,10 @@ wait_until_ready() {
     fi
     sleep 1
   done
+  if command -v docker > /dev/null; then
+    docker compose ps -a >&2 || true
+    docker compose logs --tail 40 app >&2 || true
+  fi
   fail "TaskForge did not become ready at $BASE_URL"
 }
 
@@ -172,12 +176,19 @@ demo_crash() {
   submit '{"name":"Month-end billing","type":"SLOW_FOR_TESTING","timeoutSeconds":60}'
   wait_for_status "$JOB_ID" RUNNING 10
 
+  local container
+  container="$(docker compose ps -q app)"
+  [[ -n "$container" ]] || fail "no running app container found"
+
   show "docker compose kill -s SIGKILL app"
-  docker compose kill -s SIGKILL app > /dev/null 2>&1
-  ok "container killed while the job was RUNNING"
+  docker compose kill -s SIGKILL app > /dev/null
+  # kill returns once the signal is sent, not when the container has
+  # exited. Starting before it exits is a no-op, and the stack stays down.
+  docker wait "$container" > /dev/null
+  ok "container killed while the job was RUNNING (exit code 137)"
 
   show "docker compose start app"
-  docker compose start app > /dev/null 2>&1
+  docker compose start app
   wait_until_ready 90
   ok "restarted and ready"
   print_attempts "$JOB_ID"
